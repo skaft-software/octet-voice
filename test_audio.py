@@ -236,13 +236,37 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         capture.feed_data(b"a" * 659)
         self.assertEqual(await asyncio.wait_for(read, 0.2), b"a" * 960)
 
-    async def test_capture_discards_oldest_when_consumer_is_slow(self):
+    async def test_capture_overflow_fails_and_signals_without_a_reader(self):
+        losses = []
+        self.audio._on_capture_loss = lambda: losses.append(True)
         await self.audio.start()
-        chunks = [bytes([i]) * 960 for i in range(30)]
-        self.processes[0].stdout.feed_data(b"".join(chunks))
+        chunks = [bytes([i]) * 960 for i in range(audio.CAPTURE_CHUNKS + 1)]
+        self.processes[0].stdout.feed_data(b"".join(chunks[:-1]))
         await eventually(lambda: len(self.audio._capture_chunks) == audio.CAPTURE_CHUNKS)
-        self.assertEqual(await self.audio.read(), chunks[-10])
-        self.assertEqual(self.audio.status()["capture_queued_chunks"], 9)
+        self.assertIsNone(self.audio.status()["capture_error"])
+        self.processes[0].stdout.feed_data(chunks[-1])
+        await eventually(lambda: bool(losses))
+        self.assertEqual(losses, [True])
+        self.assertEqual(self.audio.status()["capture_queued_chunks"], 0)
+        self.audio.set_muted(True)
+        self.audio.set_muted(False)
+        with self.assertRaisesRegex(audio.AudioError, "capture queue overflow"):
+            await self.audio.read()
+
+    async def test_mute_transition_while_capture_waits_on_condition_discards_old_chunk(self):
+        await self.audio.start()
+        capture = self.processes[0].stdout
+        async with self.audio._capture_ready:
+            capture.feed_data(b"a" * audio.CHUNK_BYTES)
+            await eventually(lambda: not capture._buffer)
+            # The pump consumed the old chunk but cannot publish it until this
+            # lock is released. Cross both transitions before it can do so.
+            self.audio.set_muted(True)
+            self.audio.set_muted(False)
+        await asyncio.sleep(0.01)
+        self.assertFalse(self.audio._capture_chunks)
+        capture.feed_data(b"b" * audio.CHUNK_BYTES)
+        self.assertEqual(await asyncio.wait_for(self.audio.read(), 0.2), b"b" * audio.CHUNK_BYTES)
 
     async def test_mute_clears_queue_and_continues_discarding(self):
         await self.audio.start()
@@ -359,29 +383,126 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         voiced = [frame for frame in self.processes[2].stdin.writes if frame.strip(b"\0")]
         self.assertEqual(voiced, [b"b" * 960])
 
+    async def test_capture_continues_during_intentional_playback_restart(self):
+        await self.audio.start()
+        original = self.spawn.side_effect
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        self.spawn.side_effect = delayed
+        interrupt = asyncio.create_task(self.audio.interrupt())
+        try:
+            await asyncio.wait_for(entered.wait(), 0.2)
+            self.assertTrue(self.processes[1].terminated)
+            self.processes[0].stdout.feed_data(b"a" * 960)
+            self.assertEqual(await asyncio.wait_for(self.audio.read(), 0.2), b"a" * 960)
+        finally:
+            release.set()
+            await interrupt
+
     async def test_capture_eof_wakes_readers_and_rejects_partial_chunk(self):
+        losses = []
+        self.audio._on_capture_loss = lambda: losses.append(True)
         await self.audio.start()
         read = asyncio.create_task(self.audio.read())
         self.processes[0].stdout.feed_data(b"a" * 11)
         self.processes[0].exit(1)
         with self.assertRaisesRegex(audio.AudioError, "capture failed"):
             await asyncio.wait_for(read, 0.2)
+        self.assertEqual(losses, [True])
 
-    async def test_playback_failure_is_reported(self):
+    async def test_playback_failure_is_reported_until_stop_and_restart(self):
+        failures = []
+        self.audio._on_playback_failure = lambda: failures.append(True)
         await self.audio.start()
         self.processes[1].stdin.error = BrokenPipeError()
         await self.audio.play(b"a" * 960)
         await eventually(lambda: self.audio._playback_error is not None)
+        self.assertEqual(failures, [True])
         with self.assertRaisesRegex(audio.AudioError, "playback failed"):
             await self.audio.play(b"bb")
-        await self.audio.interrupt()
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await self.audio.interrupt()
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await self.audio.read()
+        await self.audio.stop()
+        await self.audio.start()
         await self.audio.play(b"cc")
+
+    async def test_silent_playback_failure_wakes_read_even_if_interrupted_first(self):
+        await self.audio.start()
+        reader = asyncio.create_task(self.audio.read())
+        await asyncio.sleep(0)
+        try:
+            # Hold the notification lock so interruption deterministically races
+            # the output error before the waiting reader can observe it.
+            async with self.audio._capture_ready:
+                self.processes[1].stdin.error = BrokenPipeError()
+                await eventually(lambda: self.audio._playback_error is not None)
+                with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+                    await self.audio.interrupt()
+                self.assertEqual(len(self.processes), 2)
+            with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+                await asyncio.wait_for(reader, 0.2)
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+    async def test_playback_failure_discards_queued_and_future_capture(self):
+        await self.audio.start()
+        self.processes[0].stdout.feed_data(b"a" * 960)
+        await eventually(lambda: len(self.audio._capture_chunks) == 1)
+        self.processes[1].stdin.error = BrokenPipeError()
+        await eventually(lambda: self.audio._playback_error is not None)
+        self.processes[0].stdout.feed_data(b"b" * 960)
+        await asyncio.sleep(0.01)
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await self.audio.read()
+        self.assertEqual(len(self.audio._capture_chunks), 0)
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await self.audio.play(b"cc")
 
     async def test_playback_exit_before_worker_writes(self):
         await self.audio.start()
         self.processes[1].exit(1)
         with self.assertRaisesRegex(audio.AudioError, "exited"):
             await self.audio.play(b"aa")
+
+    async def test_playback_exit_during_silence_wakes_read(self):
+        await self.audio.start()
+        reader = asyncio.create_task(self.audio.read())
+        await asyncio.sleep(0)
+        self.processes[1].exit(1)
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await asyncio.wait_for(reader, 0.2)
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await self.audio.read()
+
+    async def test_child_exit_fences_queued_capture_before_the_worker_observes_it(self):
+        await self.audio.start()
+        self.processes[0].stdout.feed_data(b"a" * 960)
+        await eventually(lambda: len(self.audio._capture_chunks) == 1)
+        self.processes[1].exit(1)
+        with self.assertRaisesRegex(audio.AudioError, "playback exited"):
+            await self.audio.read()
+        await eventually(lambda: self.audio._playback_error is not None)
+        self.assertFalse(self.audio._capture_chunks)
+
+    async def test_interrupt_cannot_hide_a_child_exit_before_the_worker_observes_it(self):
+        await self.audio.start()
+        reader = asyncio.create_task(self.audio.read())
+        await asyncio.sleep(0)
+        self.processes[1].exit(1)
+        with self.assertRaisesRegex(audio.AudioError, "playback exited"):
+            await self.audio.interrupt()
+        self.assertEqual(len(self.processes), 2)
+        with self.assertRaisesRegex(audio.AudioError, "playback failed"):
+            await asyncio.wait_for(reader, 0.2)
 
     async def test_drain_timeout_fails_without_unbounded_backlog(self):
         await self.audio.start()
@@ -452,6 +573,163 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(p.waited for p in self.processes))
         self.assertFalse(self.audio.status()["running"])
 
+    async def test_late_child_cleanup_failure_retains_ownership_and_fences_restart(self):
+        # The process can arrive after either cancellation or the first spawn
+        # timeout. If closing it fails, start() must retain its handle even
+        # though _spawn() never returned normally.
+        real_wait_for = asyncio.wait_for
+        real_close = audio._close_process
+        original_spawn = self.spawn.side_effect
+        for playback in (False, True):
+            for cancelled in (False, True):
+                with self.subTest(playback=playback, cancelled=cancelled):
+                    entered, release, interrupted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    child = FakeProcess(capture=not playback)
+                    initial_capture = FakeProcess(capture=True)
+
+                    async def spawn(*args, **kwargs):
+                        if playback and kwargs["stdout"] == asyncio.subprocess.PIPE:
+                            return initial_capture
+                        entered.set()
+                        await release.wait()
+                        return child
+
+                    async def wait_for(awaitable, timeout):
+                        try:
+                            return await real_wait_for(awaitable, timeout)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            if timeout == 0.05:
+                                interrupted.set()
+                            raise
+
+                    async def close(process):
+                        if process is child:
+                            raise audio.AudioError("late child cleanup failed")
+                        await real_close(process)
+
+                    self.spawn.side_effect = spawn
+                    try:
+                        with mock.patch.object(audio, "START_TIMEOUT", 0.05), \
+                                mock.patch.object(audio.asyncio, "wait_for", side_effect=wait_for), \
+                                mock.patch.object(audio, "_close_process", side_effect=close):
+                            start = asyncio.create_task(self.audio.start())
+                            await real_wait_for(entered.wait(), 1)
+                            if cancelled:
+                                start.cancel()
+                            await real_wait_for(interrupted.wait(), 1)
+                            release.set()
+                            with self.assertRaisesRegex(audio.AudioError, "cleanup failed"):
+                                await real_wait_for(start, 1)
+                            retained = self.audio._playback if playback else self.audio._capture
+                            self.assertIs(retained, child)
+                            with self.assertRaisesRegex(audio.AudioError, "cleanup failed"):
+                                await self.audio.stop()
+                            with self.assertRaisesRegex(audio.AudioError, "cleanup"):
+                                await self.audio.start()
+                    finally:
+                        release.set()
+                        await self.audio.stop()
+                    self.assertTrue(child.waited)
+                    self.spawn.side_effect = original_spawn
+                    await self.audio.start()
+                    await self.audio.stop()
+
+    async def test_second_cancel_at_spawn_completion_cannot_lose_the_child(self):
+        real_close = audio._close_process
+        for playback in (False, True):
+            for cleanup_failure in (False, True):
+                with self.subTest(playback=playback, cleanup_failure=cleanup_failure):
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    child = FakeProcess(capture=not playback)
+                    initial_capture = FakeProcess(capture=True)
+
+                    async def spawn(*args, **kwargs):
+                        if playback and kwargs["stdout"] == asyncio.subprocess.PIPE:
+                            return initial_capture
+                        entered.set()
+                        await release.wait()
+                        start.cancel()  # Cancellation races the completed subprocess result.
+                        return child
+
+                    async def close(process):
+                        if process is child and cleanup_failure:
+                            raise audio.AudioError("late child cleanup failed")
+                        await real_close(process)
+
+                    self.spawn.side_effect = spawn
+                    try:
+                        with mock.patch.object(audio, "_close_process", side_effect=close):
+                            start = asyncio.create_task(self.audio.start())
+                            await asyncio.wait_for(entered.wait(), 1)
+                            start.cancel()
+                            await asyncio.sleep(0)
+                            await asyncio.sleep(0)
+                            release.set()
+                            if cleanup_failure:
+                                with self.assertRaisesRegex(audio.AudioError, "cleanup failed"):
+                                    await asyncio.wait_for(start, 1)
+                                retained = self.audio._playback if playback else self.audio._capture
+                                self.assertIs(retained, child)
+                                with self.assertRaisesRegex(audio.AudioError, "cleanup"):
+                                    await self.audio.start()
+                            else:
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await asyncio.wait_for(start, 1)
+                                self.assertTrue(child.terminated and child.waited)
+                    finally:
+                        release.set()
+                        await self.audio.stop()
+                    self.assertTrue(child.waited)
+
+    async def test_late_playback_restart_cleanup_failure_retains_child(self):
+        await self.audio.start()
+        capture = self.processes[0]
+        child = FakeProcess(capture=False)
+        entered, release, timed_out = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        real_wait_for, real_close = asyncio.wait_for, audio._close_process
+
+        async def spawn(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return child
+
+        async def wait_for(awaitable, timeout):
+            try:
+                return await real_wait_for(awaitable, timeout)
+            except asyncio.TimeoutError:
+                if timeout == 0.05:
+                    timed_out.set()
+                raise
+
+        async def close(process):
+            if process is child:
+                raise audio.AudioError("late playback cleanup failed")
+            await real_close(process)
+
+        self.spawn.side_effect = spawn
+        try:
+            with mock.patch.object(audio, "START_TIMEOUT", 0.05), \
+                    mock.patch.object(audio.asyncio, "wait_for", side_effect=wait_for), \
+                    mock.patch.object(audio, "_close_process", side_effect=close):
+                interrupt = asyncio.create_task(self.audio.interrupt())
+                await real_wait_for(entered.wait(), 1)
+                await real_wait_for(timed_out.wait(), 1)
+                release.set()
+                with self.assertRaisesRegex(audio.AudioError, "cleanup failed"):
+                    await real_wait_for(interrupt, 1)
+                self.assertIs(self.audio._playback, child)
+                with self.assertRaisesRegex(audio.AudioError, "playback restart failed"):
+                    await self.audio.read()
+                with self.assertRaisesRegex(audio.AudioError, "cleanup failed"):
+                    await self.audio.stop()
+                self.assertTrue(capture.waited)
+                with self.assertRaisesRegex(audio.AudioError, "cleanup"):
+                    await self.audio.start()
+        finally:
+            release.set()
+            await self.audio.stop()
+        self.assertTrue(child.waited)
+
     async def test_play_during_interrupt_fails_instead_of_admitting_stale_audio(self):
         await self.audio.start()
         self.processes[1].ignore_terminate = True
@@ -465,9 +743,13 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_interrupt_is_recoverable_by_stop(self):
         await self.audio.start()
+        reader = asyncio.create_task(self.audio.read())
+        await asyncio.sleep(0)
         self.spawn.side_effect = OSError("cannot restart")
         with self.assertRaises(OSError):
             await self.audio.interrupt()
+        with self.assertRaisesRegex(audio.AudioError, "playback restart failed"):
+            await asyncio.wait_for(reader, 0.2)
         with self.assertRaises(audio.AudioError):
             await self.audio.play(b"aa")
         await self.audio.stop()

@@ -7,8 +7,11 @@ replace octet's authentication, process supervisor, UI protocol, or coding agent
   an explicit source allowlist, including the reviewed Python SDK under `vendor/`.
 - The SDK snapshot has unreleased generic API 0.4 convenience surfaces for static
   shortcuts, credential resolution, input injection, request timeouts, and cached
-  remote UI. See `SDK-PROVENANCE.txt` and `tests/sdk/`. No globally installed SDK
-  is modified; the native host protocol is unchanged.
+  remote UI. See `SDK-PROVENANCE.txt` and `tests/sdk/`. The separately reviewed
+  candidate-host SDK diff is available as `patches/sdk-api-0.4.patch` in this source
+  repository; it applies to base `47389ad1` and is not included in the extension
+  archive. No globally installed SDK is modified; the native host protocol is
+  unchanged. Review and retest the diff against the host revision being integrated.
 - `patches/quiet-shortcuts.patch` is an optional generic host patch. It removes
   the two unconditional shortcut-dispatch transcript notices, preserving actual
   results/errors. It is not applied or included in installed extension bundles.
@@ -18,6 +21,25 @@ replace octet's authentication, process supervisor, UI protocol, or coding agent
   native OAuth login and refresh as coding. No second sign-in or credential-file
   discovery is implemented. Public OpenAI Realtime uses the native OpenAI provider
   instead, only when explicitly selected.
+
+## Private v0.10.0 handoff
+
+The private repository's provider-free workflow tests Linux, macOS and Windows,
+then builds a reproducible source-only bundle and uploads the
+`octet-voice-0.10.0-experimental` workflow artifact. It contains the archive,
+`SHA256SUMS`, and `SOURCE_COMMIT`. The artifact is available only to identities
+with access to the private workflow run and expires after 30 days. Obtain the
+expected commit and digest through a trusted channel; a checksum in the same
+artifact alone does not authenticate its origin. The manifest targets exactly
+host version 0.10.0. Test the actual target host build rather than inferring its
+source from that version string.
+
+Release workers do not automatically discover this separate repository: the
+native host's compiled official catalog and release packaging consume the host
+repository's `extensions/release-catalog.txt`. This private experiment is not
+in that catalog. It may be explicitly installed from its reviewed local archive;
+adding it to a public official release would be a separate publication and
+qualification decision. Do not silently copy it into a public release.
 
 ## Qualification boundaries
 

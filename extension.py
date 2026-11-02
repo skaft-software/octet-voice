@@ -20,9 +20,10 @@ import settings
 VOICE_INPUT_PREFIX = "[Voice handoff to coding agent]\n"
 
 HELP = ("/voice [start|stop|mute|status|devices|settings]\n"
-        "/voice backend codex|openai · /voice model NAME · /voice speaker NAME\n"
-        "Ctrl+F8 toggles voice; Ctrl+F9 toggles microphone mute; Ctrl+F10 stops immediately, even during coding.\n"
-        "Starting voice sends microphone audio, typed prompts, and completed agent answers to OpenAI. "
+        "/voice captions up|down · /voice backend codex|openai · /voice model NAME · /voice speaker NAME\n"
+        "Ctrl+F6/F7 scroll captions; Ctrl+F8 toggles voice; Ctrl+F9 toggles microphone mute; "
+        "Ctrl+F10 stops immediately, even during coding.\n"
+        "Starting voice sends microphone audio, observed typed prompts, and completed agent answers to OpenAI. "
         "No recording is saved. Use headphones: local acoustic echo cancellation is not included.")
 
 
@@ -90,10 +91,20 @@ def build_extension():
         if action == "stop" and len(arguments) == 1:
             return stop_quietly()
         if action == "mute" and len(arguments) == 1:
-            service.call(service.mute())
-            return ""
+            result = service.call(service.mute(context.get("resource_owner")))
+            return "" if result in ("Microphone muted", "Microphone live", "Voice is stopped") else result
+        if action == "captions" and len(arguments) == 2 and arguments[1] in ("up", "down"):
+            if service.owns(context) and strip.page(-1 if arguments[1] == "up" else 1):
+                return ""
+            return "No live voice captions to scroll in this session."
         if action == "status" and len(arguments) == 1:
-            return json.dumps({"voice": service.snapshot(), "audio": probe()}, indent=2)
+            # Command results enter native history; ephemeral speech belongs only
+            # on the live strip, never in a status report or diagnostic transcript.
+            snapshot = service.snapshot()
+            status = {key: snapshot[key] for key in (
+                "state", "muted", "microphone_level", "speaker_level",
+                "backend", "error", "elapsed_seconds")}
+            return json.dumps({"voice": status, "audio": probe()}, indent=2)
         if action == "devices" and len(arguments) == 1:
             if sys.platform in ("darwin", "win32"):
                 try:
@@ -141,6 +152,18 @@ def build_extension():
                  usage="/voice [start|stop|mute|status|devices|settings]")
     def voice(arguments, context):
         return {"text": safe_control(arguments, context)}
+
+    @ext.shortcut(name="voice-caption-up")
+    def caption_up(context):
+        if service.owns(context):
+            strip.page(-1)
+        return {"text": ""}
+
+    @ext.shortcut(name="voice-caption-down")
+    def caption_down(context):
+        if service.owns(context):
+            strip.page(1)
+        return {"text": ""}
 
     @ext.shortcut(name="voice-toggle")
     def toggle(context):

@@ -13,11 +13,17 @@ Not in the official release catalog; no automatic enablement or recording.
 
 ## Controls
 
+- **Ctrl+F6 / Ctrl+F7** or `/voice captions up|down`: scroll live captions one
+  wrapped row at a time without moving composer focus.
 - **Ctrl+F8** or `/voice`: start/stop. Nothing opens the microphone on startup.
-- **Ctrl+F9** or `/voice mute`: mute/unmute. Capture is drained and discarded while
-  muted; queued outgoing WebRTC samples are cleared. The capture device remains
-  open. **Stop** to close it.
+- **Ctrl+F9** or `/voice mute`: mute/unmute the microphone for the owning session.
+  Capture is drained and discarded while muted; queued outgoing WebRTC samples are
+  cleared. On OpenAI, mute also clears uncommitted server input and waits for its
+  acknowledgement before allowing unmute; if confirmation fails, voice stops.
+  Input already committed by the server cannot be retracted. The capture device
+  remains open. **Stop** to close it.
 - **Ctrl+F10** or `/voice stop`: stop, including while coding via the shortcut.
+  Stop is intentionally available across sessions as an emergency privacy control.
   If your terminal intercepts these modified function keys, use slash commands while idle. Stopping
   voice **does not cancel already admitted coding work**; use native Escape/Ctrl+C.
 - `/voice status`, `/voice devices`, `/voice settings`; options in `/extensions`.
@@ -30,21 +36,46 @@ A persistent strip above the composer shows connection state, elapsed time,
 microphone mute, and separate microphone/output waveforms measured from actual
 PCM (RMS, -60..0 dBFS), with bounded 2.4-second histories. Muting clears the
 microphone meter; stopped/stalled streams decay to silence. The output meter
-measures PCM written to playback, not a hardware loopback. Final speech captions
-replace one ephemeral strip line; they do not append transcript messages.
-The strip resizes without taking focus or replacing the normal composer, and
-uses terminal palette colors (`NO_COLOR` disables styling). It disappears on
-stop, failure, session replacement or shutdown. Routine start/mute/stop actions
-are silent; actionable failures still appear in octet. Explicit `/voice status`
-and settings/device queries retain their requested reports.
+measures PCM written to playback, not a hardware loopback. Partial speech captions
+update live; the latest user and voice utterances are retained separately in the
+strip instead of replacing one another or appending transcript messages. They are
+ephemeral and are omitted from `/voice status`. Each utterance is bounded to
+16,384 UTF-8 bytes; exceeding the limit stops voice with an explicit error rather
+than silently clipping a caption. Older utterances are not a caption history.
+
+Captions wrap to terminal width and the heading marks them as a **preview**. Long
+captions follow the most recent speaker unless you scroll to review them. Use
+Ctrl+F6/F7 (or the slash commands above) to scroll by one wrapped row; scrolling
+persists across live updates and reflow. Press down again at the last row to resume
+following. The host does not tell the extension how
+many above-composer rows it actually allocates, and may crop the strip to protect
+other UI. If there is room for the heading, meters, their intervening padding
+and one caption row, scrolling can bring each retained row into view even if
+additional rows are hidden. In very
+small or crowded terminals the host may hide even the first caption row: enlarge
+the terminal or reduce other panels. The strip cannot guarantee all captions are
+simultaneously visible on the current host.
+
+The strip uses blank rows between its heading, meters, caption block and controls
+rather than spreading content across the terminal. Caption lines remain adjacent;
+blank lines actually present in a transcript are preserved. It switches to compact
+rows on short terminals; the host can still crop the strip because its actual
+widget budget is not exposed. The strip resizes
+without taking focus or replacing the normal composer, and uses terminal palette
+colors (`NO_COLOR` disables styling). It disappears on
+stop, failure, session replacement or shutdown. Routine start/mute/stop and
+caption shortcut actions are silent; actionable failures still appear in octet.
+Explicit `/voice status` and settings/device queries retain their requested reports.
 
 Use **headphones**. There is no local acoustic echo cancellation, so open speakers
 can feed replies back into the microphone. Server VAD handles interruption; local
 playback queues are flushed on speech-start/interrupt. Codex's current frameless
 sideband has no response-linked RTP timestamps or reliable media-restart markers:
 newly decoded RTP after interruption cannot safely be classified as old versus
-new. Server cancellation is responsible for stopping that media. This is not a
-claim of a fully qualified native Codex audio implementation.
+new. Server cancellation is responsible for stopping that media. The OpenAI
+backend clears local playback on interruption but does not send an item truncation
+based on what was actually heard, so its conversation context may retain unheard
+output. Neither path is a claim of fully qualified Codex-equivalent interruption.
 
 ## Authentication and backends
 
@@ -82,11 +113,30 @@ Connections do not reconnect or replay ambiguous handoffs automatically.
 
 ## Conversation and handoff semantics
 
-Voice speaks for the **shared active conversation**, including typed prompts and
-successful final agent answers, not a separate hidden executor. Only turns
-observed after voice starts are shared; existing history is not uploaded.
-Reasoning and raw tool output are not forwarded. Spoken answers over 3960 UTF-8
-bytes get a short notice directing you to the native answer.
+Voice speaks for the **shared active conversation**, including normal typed prompts
+and successful final agent answers, not a separate hidden executor. Only turns
+observed after voice starts are shared; existing history is not uploaded. A typed
+message used to steer an already-running agent bypasses the host's prompt hook and
+is not forwarded to voice. Reasoning and raw tool output are not forwarded. Spoken
+answers over 3960 UTF-8 bytes get a short notice directing you to the native answer.
+Shared agent updates are labeled as untrusted context rather than new user requests,
+and the OpenAI
+backend does not promote their text to developer instructions. This reduces, but
+cannot eliminate, prompt-injection or mistaken-delegation risk.
+
+Only an explicit provider delegation becomes a handoff: Codex's client delegation
+or OpenAI's `background_agent` function call. Speech transcripts alone update
+captions; they are never submitted as coding instructions or used as a fallback
+when no delegation arrives. The voice model is instructed to formulate a clear,
+self-contained request that preserves the user's intent, relevant context and
+corrections, rather than sending a partial recognition fragment. This is a model
+instruction, not a guarantee of wording or delegation; live behavior still needs
+qualification. If the bounded 200 ms capture queue fills or PortAudio reports an
+input discontinuity, voice revokes pending handoffs and stops with a warning. A
+handoff whose write has already begun may nevertheless be admitted: check octet
+before repeating the request. Muted audio is intentionally discarded. Other
+losses, including upstream PipeWire or network/media loss, may not be detected;
+use typed input when missing words or corrections would be consequential.
 
 A handoff enters `session/send_user_message` with `deliver_as: steer`, the
 retained native resource owner and the voice-start request's parent ID. Idle
@@ -105,12 +155,16 @@ coalesced by the native coding run. Final-answer/lifecycle events are not an
 independent proof that any particular request succeeded. This is a deliberate
 parity boundary until the host exposes durable correlated input receipts.
 
-Duplicate handoffs are never executed twice in a session. Pending delegation and
-media have independent bounded queues so host admission cannot stall playback or
-barge-in. Ambiguous ACKs, overflow, audio failure or disconnect stop voice with
-no retries. Owner/generation changes fence further injection; session settlement,
-shutdown and extension process-tree supervision close media. A conversation is
-limited to one hour; there is no reliable realtime spend meter in this version.
+A handoff with the same provider ID is never executed twice in a session; separate
+IDs may represent repeated requests and are not deduplicated by transcript. Pending
+delegation and media have independent bounded queues so host admission cannot stall
+playback or barge-in. Rejection or an ambiguous ACK stops voice with no retry; an
+unconfirmed request may already be queued, so check octet before resending.
+Capture, caption, playback and handoff/update-queue overflow, audio failure or
+disconnect also stop voice without retries; capture has the limits described above.
+Owner/generation changes fence further injection; session settlement, shutdown and
+extension process-tree supervision close media. A conversation is limited to one
+hour; there is no reliable realtime spend meter in this version.
 
 ## Local install
 
@@ -169,6 +223,12 @@ not. The stdlib package builder works without Bash on all three platforms;
 review its source-only archive before installing it on the target.
 The explicit staging allowlist includes both audio backends, launcher and vendored
 SDK, never a venv, cached bytecode or local credentials.
+
+For an existing managed installation, use `octet extension update --path ARCHIVE`
+instead of `install`. First end all potentially affected octet sessions: their
+extension-directory watchers can reload other extensions as well, and a running
+voice process may otherwise mix old and new Python modules. Do not modify the
+shared voice environment while another session is using it.
 
 The staging directory must be new. Review capability declarations first:
 network (OpenAI/Codex), process (private Python and Linux PipeWire), unrestricted filesystem (local
@@ -247,8 +307,11 @@ Run the same two `-m unittest discover` commands (without the POSIX assignments)
 
 Fixtures cover duplex media, V2/V3 wire frames, OAuth signaling/sideband header
 containment, malformed/oversized events, mute queue invalidation, silence pacing,
-response serialization, bounded audio backpressure, slow admission/barge-in,
+response serialization, detected capture loss and bounded audio backpressure,
+blocked sender/audio-failure cleanup, deferred close under a slow interruption,
+slow admission/barge-in,
 ambiguous ACKs without replay, handoff deduplication, source reflection prevention,
 shared-answer attribution, owner fences, credential/start cancellation races,
-shortcuts, lifecycle teardown, measured metering, quiet UI frames and private preferences. Live backend and hardware
-qualification are separate from fixture success.
+shortcuts, lifecycle teardown, measured metering, partial-caption reconciliation,
+scrolling with simulated host cropping, quiet UI frames and private preferences.
+Live backend and hardware qualification are separate from fixture success.

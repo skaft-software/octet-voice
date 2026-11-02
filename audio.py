@@ -8,7 +8,8 @@ or process group is created; children stay in the extension's supervision tree.
 
 ``start()`` explicitly opens the microphone and speaker; importing, constructing,
 ``probe()`` and ``status()`` never do. Capture is continuously drained in 20 ms
-chunks, retaining only the latest 200 ms; muted audio is discarded, not saved.
+chunks, buffering at most 200 ms; overflow stops the session rather than silently
+removing speech. Muted audio is discarded, not saved.
 Playback admission (including the in-flight chunk) is capped at 1.5 seconds;
 ``play`` raises AudioBackpressure rather than accumulating stale audio or waiting
 indefinitely. Calls must contain whole samples and fit the remaining budget.
@@ -16,7 +17,8 @@ Playback assembles full frames, briefly prebuffers network jitter, and continuou
 feeds local silence when idle. An absolute sample clock with a small output lead
 prevents scheduler oversleep from accumulating playback delay or starving PipeWire.
 ``interrupt()`` drops queued audio and restarts only playback to flush downstream
-buffers. Already audible samples cannot be retracted. Call ``stop()`` in finally.
+buffers. Playback failures remain fatal until stop/start. Already audible samples
+cannot be retracted. Call ``stop()`` in finally.
 
 Probe checks local prerequisites only, not server/device connectivity. Default
 PipeWire devices are used unless target node names/serials are supplied. Children
@@ -165,19 +167,23 @@ async def _settle(awaitable):
 class PipeWireAudio:
     """Single-event-loop audio owner; start/interrupt/stop are serialized.
 
-    ``read`` waits for the next live chunk, or raises AudioError on stop/EOF.
+    ``read`` waits for the next live chunk, or raises AudioError on stop or failure
+    of either stream.
     ``play`` accepts bytes immediately or raises AudioBackpressure. ``muted``
     can be assigned, or use synchronous ``set_muted(bool)``. Muting does not
     close the capture device: the pump keeps draining and discarding it.
     """
 
-    def __init__(self, input_target=None, output_target=None, runtime_dir=None):
+    def __init__(self, input_target=None, output_target=None, runtime_dir=None,
+                 on_capture_loss=None, on_playback_failure=None):
         for target in (input_target, output_target):
             if target is not None and (not isinstance(target, str) or not target or "\0" in target):
                 raise ValueError("Audio targets must be nonempty node names or serial strings")
         self.input_target = input_target
         self.output_target = output_target
         self.runtime_dir = runtime_dir
+        self._on_capture_loss = on_capture_loss
+        self._on_playback_failure = on_playback_failure
         self._muted = False
         self._mute_generation = 0
         self._running = False
@@ -234,6 +240,11 @@ class PipeWireAudio:
                       playback_error=self._playback_error)
         return result
 
+    def _playback_exited(self):
+        # The old playback process is intentionally closed during interruption.
+        return (not self._interrupting and self._playback is not None
+                and self._playback.returncode is not None)
+
     async def _spawn(self, playback):
         command = self._commands[1 if playback else 0]
         target = self.output_target if playback else self.input_target
@@ -242,10 +253,20 @@ class PipeWireAudio:
         if target is not None:
             args.extend(["--target", target])
         args.append("-")
-        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-            *args, stdin=asyncio.subprocess.PIPE if playback else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL if playback else asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, env=self._env, limit=CHUNK_BYTES * 4))
+        async def open_owned():
+            process = await asyncio.create_subprocess_exec(
+                *args, stdin=asyncio.subprocess.PIPE if playback else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL if playback else asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL, env=self._env, limit=CHUNK_BYTES * 4)
+            # Publish ownership inside the spawn task, before its result can race
+            # a second cancellation of the waiter.
+            if playback:
+                self._playback = process
+            else:
+                self._capture = process
+            return process
+
+        spawn = asyncio.create_task(open_owned())
         try:
             return await asyncio.wait_for(asyncio.shield(spawn), START_TIMEOUT)
         except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -256,13 +277,21 @@ class PipeWireAudio:
                 spawn.cancel()
                 await asyncio.gather(spawn, return_exceptions=True)
                 raise
+            # _stop() retains the registered child if cleanup is interrupted
+            # or cannot confirm exit.
             await _settle(_close_process(process))
+            if playback:
+                self._playback = None
+            else:
+                self._capture = None
             raise
 
     async def start(self):
         async with self._lifecycle:
             if self._running:
                 return
+            if self._capture is not None or self._playback is not None:
+                raise AudioError("PipeWire child cleanup is unconfirmed; stop audio before restarting")
             prerequisites = probe(self.runtime_dir)
             if not prerequisites["supported"]:
                 raise UnsupportedAudioError(prerequisites["error"])
@@ -285,11 +314,16 @@ class PipeWireAudio:
     async def read(self):
         async with self._capture_ready:
             await self._capture_ready.wait_for(
-                lambda: self._capture_chunks or self._capture_error or not self._running)
+                lambda: (self._capture_chunks or self._capture_error or self._playback_error
+                         or not self._running or self._playback_exited()))
             if self._capture_error:
                 raise AudioError(self._capture_error)
+            if self._playback_error:
+                raise AudioError(self._playback_error)
             if not self._running:
                 raise AudioError("Audio is stopped")
+            if self._playback_exited():
+                raise AudioError("PipeWire playback exited")
             return self._capture_chunks.popleft()
 
     async def play(self, pcm):
@@ -299,7 +333,7 @@ class PipeWireAudio:
             raise ValueError("PCM must contain whole 16-bit samples")
         if not self._running or self._interrupting:
             raise AudioError("Playback is stopped or being interrupted")
-        if self._playback_error or self._playback.returncode is not None:
+        if self._playback_error or self._playback_exited():
             raise AudioError(self._playback_error or "PipeWire playback exited")
         if self._playback_bytes + len(pcm) > PLAYBACK_MAX_BYTES:
             raise AudioBackpressure("Playback queue exceeds 1.5 seconds; interrupt or slow down")
@@ -314,17 +348,35 @@ class PipeWireAudio:
             while True:
                 generation = self._mute_generation
                 chunk = await self._capture.stdout.readexactly(CHUNK_BYTES)
-                if not self.muted and generation == self._mute_generation:
-                    self._mic_level = (pcm_level(chunk), time.monotonic())
+                if (not self.muted and generation == self._mute_generation
+                        and not self._playback_error and not self._playback_exited()):
                     async with self._capture_ready:
-                        self._capture_chunks.append(chunk)
-                        self._capture_ready.notify_all()
+                        # Muting may have cleared the queue while this task was
+                        # waiting for the condition lock. Never reinsert an old
+                        # chunk after a mute or an intervening mute/unmute cycle.
+                        if (not self.muted and generation == self._mute_generation
+                                and not self._playback_error and not self._playback_exited()):
+                            if len(self._capture_chunks) == CAPTURE_CHUNKS:
+                                self._capture_error = "PipeWire capture queue overflow; audio was lost"
+                                self._capture_chunks.clear()
+                                self._mic_level = (0.0, 0.0)
+                                # Revoke handoffs immediately, even if the sender is
+                                # blocked and no read() is waiting for this error.
+                                if self._on_capture_loss is not None:
+                                    self._on_capture_loss()
+                                self._capture_ready.notify_all()
+                                return
+                            self._mic_level = (pcm_level(chunk), time.monotonic())
+                            self._capture_chunks.append(chunk)
+                            self._capture_ready.notify_all()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             async with self._capture_ready:
                 self._capture_error = f"PipeWire capture failed ({type(exc).__name__})"
                 self._capture_chunks.clear()
+                if self._on_capture_loss is not None:
+                    self._on_capture_loss()
                 self._capture_ready.notify_all()
 
     def _output_frame(self, now):
@@ -360,6 +412,8 @@ class PipeWireAudio:
             while True:
                 deadline = max(deadline, time.monotonic() - PLAYBACK_LEAD_SECONDS + CHUNK_SECONDS)
                 await asyncio.sleep(max(0, deadline - time.monotonic()))
+                if self._playback.returncode is not None:
+                    raise AudioError("PipeWire playback exited")
                 chunk, admitted = self._output_frame(time.monotonic())
                 self._playback.stdin.write(chunk)
                 await asyncio.wait_for(self._playback.stdin.drain(), PROCESS_TIMEOUT)
@@ -369,26 +423,40 @@ class PipeWireAudio:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._playback_error = f"PipeWire playback failed ({type(exc).__name__})"
-            self._playback_chunks.clear()
-            self._playback_bytes = 0
+            await self._fail_playback(f"PipeWire playback failed ({type(exc).__name__})")
+
+    async def _fail_playback(self, message):
+        self._playback_error = message
+        self._playback_chunks.clear()
+        self._playback_bytes = 0
+        self._capture_chunks.clear()
+        self._mic_level = self._speaker_level = (0.0, 0.0)
+        if self._on_playback_failure is not None:
+            self._on_playback_failure()
+        async with self._capture_ready:
+            self._capture_ready.notify_all()
 
     async def interrupt(self):
         async with self._lifecycle:
             if not self._running:
                 return
+            if self._playback_error or self._playback_exited():
+                raise AudioError(self._playback_error or "PipeWire playback exited")
             await _settle(self._interrupt())
 
     async def _interrupt(self):
+        # The playback worker or child may have failed while _settle scheduled us.
+        if self._playback_error or self._playback_exited():
+            raise AudioError(self._playback_error or "PipeWire playback exited")
         self._interrupting = True
         try:
             await self._stop_playback()
             self._playback = await self._spawn(True)
             self._playback.stdin.transport.set_write_buffer_limits(high=CHUNK_BYTES, low=0)
-            self._playback_error = None
             self._playback_task = asyncio.create_task(self._playback_loop())
         except BaseException:
-            self._playback_error = "PipeWire playback restart failed; stop audio before retrying"
+            if not self._playback_error:
+                await self._fail_playback("PipeWire playback restart failed; stop audio before retrying")
             raise
         finally:
             self._interrupting = False

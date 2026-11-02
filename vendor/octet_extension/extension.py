@@ -348,8 +348,32 @@ class _PendingResponse:
 @dataclass
 class _WriteItem:
     message: Mapping[str, Any]
+    deadline: Optional[float] = None
+    cancellation_event: Optional[threading.Event] = None
+    cancellation: Optional[CancellationToken] = None
+    cancellation_not_before: Optional[float] = None
+    pending: Optional[_PendingResponse] = None
+    cancel_for: Optional["_WriteItem"] = None
     done: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
     error: Optional[BaseException] = None
+    started: bool = False
+    abandoned: bool = False
+
+    def interruption(self) -> Optional[tuple[bool, str]]:
+        if (self.cancellation is not None and self.cancellation.cancelled
+                and (self.cancellation_not_before is None or time.monotonic() >= self.cancellation_not_before)):
+            return False, self.cancellation.reason or "parent_cancelled"
+        if self.cancellation_event is not None and self.cancellation_event.is_set():
+            return False, "cancelled"
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            return True, "timeout"
+        return None
+
+    def wait_interval(self) -> float:
+        if self.deadline is None:
+            return 0.05
+        return min(0.05, max(0.0, self.deadline - time.monotonic()))
 
 
 @dataclass(frozen=True)
@@ -378,15 +402,21 @@ def _protocol_stream(stream: Any) -> Any:
 
 
 class _SerializedWriter:
-    """One bounded queue and one stdout owner for complete JSON-RPC frames."""
+    """One bounded FIFO and one stdout owner for complete JSON-RPC frames."""
 
     _STOP = object()
 
-    def __init__(self, transport: JsonRpcTransport, capacity: int) -> None:
+    def __init__(self, transport: JsonRpcTransport, capacity: int,
+                 on_cancel_failure: Callable[[], None]) -> None:
         if capacity <= 0:
             raise ValueError("writer_queue_size must be greater than zero")
         self._transport = transport
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=capacity)
+        self._on_cancel_failure = on_cancel_failure
+        # Reserve a bounded cancellation lane and one stop slot, while keeping
+        # all frames in a single FIFO. Ordinary sends retain their existing bound.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=2 * capacity + 1)
+        self._ordinary_slots = threading.BoundedSemaphore(capacity)
+        self._cancel_slots = threading.BoundedSemaphore(capacity)
         self._closed = threading.Event()
         self._failure: Optional[BaseException] = None
         self._thread = threading.Thread(
@@ -400,52 +430,105 @@ class _SerializedWriter:
 
     def send(self, message: Mapping[str, Any]) -> None:
         item = _WriteItem(message)
-        while True:
+        self.enqueue(item, lambda: False)
+        self.wait(item, lambda: False)
+
+    def enqueue(self, item: _WriteItem, stop: Callable[[], bool]) -> bool:
+        while not stop():
             if self._closed.is_set():
                 raise self._closed_error()
-            try:
-                self._queue.put(item, timeout=0.05)
-                break
-            except queue.Full:
-                continue
-        while not item.done.wait(0.05):
-            if self._closed.is_set() and self._failure is not None:
+            if self._ordinary_slots.acquire(timeout=item.wait_interval()):
+                if stop() or self._closed.is_set():
+                    self._ordinary_slots.release()
+                    if self._closed.is_set() and not stop():
+                        raise self._closed_error()
+                    return False
+                self._queue.put_nowait(item)
+                return True
+        return False
+
+    def wait(self, item: _WriteItem, stop: Callable[[], bool]) -> None:
+        while not stop():
+            if item.done.wait(item.wait_interval()):
+                if item.error is not None:
+                    raise item.error
+                return
+            if self._closed.is_set():
                 raise self._closed_error()
-        if item.error is not None:
-            raise item.error
+
+    def abandon(self, item: _WriteItem, reason: Optional[str] = None) -> bool:
+        """Suppress an unwritten request or queue one ordered cancellation.
+
+        Once the writer has claimed a frame its outcome is ambiguous; never
+        interrupt or retry that write. A separate bounded reservation means the
+        caller need not wait for stdout to make room for its cancellation.
+        """
+        with item.lock:
+            if not item.started:
+                item.abandoned = True
+                return True
+            if reason is None or item.error is not None:
+                return True
+            if self._closed.is_set() or not self._cancel_slots.acquire(blocking=False):
+                return False
+            cancellation = _WriteItem({
+                "jsonrpc": "2.0", "method": "$/cancelRequest",
+                "params": {"id": item.message["id"], "reason": reason},
+            }, cancel_for=item)
+            self._queue.put_nowait(cancellation)
+            return True
+
+    def abort(self) -> None:
+        # An in-progress transport write must finish (or fail) on its own.
+        # No later queued frame is written after that point.
+        self._closed.set()
 
     def close(self) -> None:
         if self._closed.is_set():
             return
-        while True:
-            try:
-                self._queue.put(self._STOP, timeout=0.05)
-                break
-            except queue.Full:
-                if self._closed.is_set():
-                    return
+        self._queue.put_nowait(self._STOP)
         self._thread.join(timeout=2.0)
         self._closed.set()
 
     def _run(self) -> None:
         try:
-            while True:
-                item = self._queue.get()
+            while not self._closed.is_set():
+                try:
+                    item = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
                 if item is self._STOP:
                     return
                 assert isinstance(item, _WriteItem)
+                (self._cancel_slots if item.cancel_for is not None else self._ordinary_slots).release()
+                with item.lock:
+                    if (self._closed.is_set() or item.abandoned or item.interruption() is not None
+                            or (item.pending is not None and item.pending.error is not None)
+                            or (item.cancel_for is not None and item.cancel_for.error is not None)):
+                        item.abandoned = True
+                        item.done.set()
+                        continue
+                    # Claiming the item is the write-start boundary. The caller
+                    # can now return, but only this thread may finish the frame.
+                    item.started = True
                 try:
                     self._transport.send(item.message)
                 except ProtocolError as error:
-                    # A locally invalid/oversized frame is rejected without
-                    # sacrificing an otherwise healthy persistent stream.
+                    # A locally invalid/oversized frame does not damage stdout.
                     item.error = error
                     item.done.set()
+                    if item.cancel_for is not None:
+                        self._closed.set()
+                        self._on_cancel_failure()
+                        return
                     continue
                 except BaseException as error:
                     item.error = error
                     self._failure = error
                     item.done.set()
+                    if item.cancel_for is not None:
+                        self._closed.set()
+                        self._on_cancel_failure()
                     return
                 item.done.set()
         finally:
@@ -456,6 +539,7 @@ class _SerializedWriter:
                 except queue.Empty:
                     break
                 if isinstance(pending, _WriteItem):
+                    (self._cancel_slots if pending.cancel_for is not None else self._ordinary_slots).release()
                     pending.error = self._closed_error()
                     pending.done.set()
 
@@ -537,6 +621,7 @@ class Extension:
         self._writer: Optional[_SerializedWriter] = None
         self._executor: Optional[ThreadPoolExecutor] = None
         self._teardown_executor: Optional[ThreadPoolExecutor] = None
+        self._resize_tail: Optional[Future[Any]] = None
         self._fail_closed_deadline: Optional[float] = None
         self._initialized = False
         self._running = False
@@ -880,7 +965,11 @@ class Extension:
     lifecycle = on_lifecycle
 
     def on_ui_event(self, method: str) -> Callable[[Handler], Handler]:
-        """Handle a negotiated remote_ui notification without acquiring terminal ownership."""
+        """Handle a negotiated remote_ui notification without acquiring terminal ownership.
+
+        Resize handlers run in arrival order. If admission is full or a resize
+        handler fails, the extension fails closed and invokes the shutdown hook.
+        """
         if method not in _REMOTE_UI_EVENTS or self.api_version != "0.4":
             raise ValueError("unknown remote UI notification or unsupported API")
 
@@ -1031,7 +1120,13 @@ class Extension:
         timeout: Optional[float] = None,
         cancellation_event: Optional[threading.Event] = None,
     ) -> Any:
-        """Send a host request with optional timeout and cooperative cancellation."""
+        """Send a host request with optional timeout and cooperative cancellation.
+
+        The deadline includes enqueueing and writing as well as the reply wait.
+        An unwritten expired request is suppressed; an already-started write is
+        ambiguous and queues one ordered cancellation without being retried. A
+        full or failed cancellation lane instead fails the extension closed.
+        """
 
         return self._request(
             method,
@@ -1086,51 +1181,54 @@ class Extension:
             pending = _PendingResponse()
             self._pending[key] = pending
         try:
-            if cancellation_event is not None and cancellation_event.is_set():
-                raise CancelledError("cancelled")
-            self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": payload,
-                }
-            )
+            writer = self._writer
+            if writer is None or self._closed:
+                raise RpcError(-32000, "protocol transport is closed")
             scope = _CURRENT_REQUEST.get() if cancel_with_parent else None
-            cancellation_sent = False
+            parent_cancellation = scope.cancellation if scope is not None else None
+            # A cancelled bulk reader makes a best-effort release of its lease.
+            # Preserve that cleanup's existing one-poll opportunity to send, but
+            # never let an already-cancelled parent strand it behind stdout.
+            cleanup_grace = (time.monotonic() + 0.05 if method == "bulk/release"
+                             and parent_cancellation is not None and parent_cancellation.cancelled else None)
+            item = _WriteItem(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": payload},
+                deadline=deadline, cancellation_event=cancellation_event,
+                cancellation=parent_cancellation, cancellation_not_before=cleanup_grace, pending=pending,
+            )
+
+            def stopped() -> bool:
+                return pending.event.is_set() or item.interruption() is not None
+
+            try:
+                if writer.enqueue(item, stopped):
+                    writer.wait(item, stopped)
+            except (BrokenPipeError, OSError) as error:
+                self._closed = True
+                raise RpcError(-32000, "protocol stream is closed") from error
+
             while True:
-                wait = 0.05 if deadline is None else min(0.05, max(0.0, deadline - time.monotonic()))
-                if pending.event.wait(wait):
+                # A reply already observed wins the cancellation race. Failure
+                # during shutdown must also suppress an as-yet-unwritten item.
+                if pending.event.is_set():
+                    if pending.error is not None:
+                        writer.abandon(item)
                     break
+                interruption = item.interruption()
+                if interruption is not None:
+                    timed_out, reason = interruption
+                    if not writer.abandon(item, reason):
+                        # Never block the request on a full cancellation lane or
+                        # silently lose cancellation: stop the process instead.
+                        writer.abort()
+                        self._fail_closed("writer_overflow", "writer cancellation queue is full")
+                    if timed_out:
+                        raise TimeoutError(f"host request timed out: {method}")
+                    raise CancelledError(reason)
                 if self._closed:
+                    writer.abandon(item)
                     raise RpcError(-32000, "protocol transport is closed")
-                if scope is not None and scope.cancellation.cancelled and not cancellation_sent:
-                    cancellation_sent = True
-                    self._send(
-                        {
-                            "jsonrpc": "2.0",
-                            "method": "$/cancelRequest",
-                            "params": {
-                                "id": request_id,
-                                "reason": scope.cancellation.reason or "parent_cancelled",
-                            },
-                        }
-                    )
-                    raise CancelledError(scope.cancellation.reason or "parent_cancelled")
-                if cancellation_event is not None and cancellation_event.is_set():
-                    self._send({
-                        "jsonrpc": "2.0", "method": "$/cancelRequest",
-                        "params": {"id": request_id, "reason": "cancelled"},
-                    })
-                    raise CancelledError("cancelled")
-                if deadline is not None and time.monotonic() >= deadline:
-                    if not cancellation_sent:
-                        cancellation_sent = True
-                        self._send({
-                            "jsonrpc": "2.0", "method": "$/cancelRequest",
-                            "params": {"id": request_id, "reason": "timeout"},
-                        })
-                    raise TimeoutError(f"host request timed out: {method}")
+                pending.event.wait(item.wait_interval())
             if pending.error is not None:
                 raise pending.error
             response = pending.response
@@ -1892,6 +1990,8 @@ class Extension:
 
         if self._running:
             raise RuntimeError("extension is already running")
+        if self._writer is not None and self._writer._thread.is_alive():
+            raise RuntimeError("previous extension protocol writer has not stopped")
         reader = stdin if stdin is not None else self.stdin
         writer = stdout if stdout is not None else self.stdout
         if reader is None:
@@ -1908,7 +2008,10 @@ class Extension:
             writer,
             max_message_bytes=self.max_message_bytes,
         )
-        self._writer = _SerializedWriter(self._transport, self.writer_queue_size)
+        self._writer = _SerializedWriter(
+            self._transport, self.writer_queue_size,
+            lambda: self._fail_closed("writer_failure", "writer cancellation failed"),
+        )
         self._writer.start()
         inbound: queue.Queue[Any] = queue.Queue()
         reader_thread = threading.Thread(
@@ -1962,7 +2065,10 @@ class Extension:
             self._running = False
             self._closed = True
             self._transport = None
-            self._writer = None
+            # A stalled write can outlive run(). Retain it so a subsequent run
+            # cannot create a second writer concurrently on the same stream.
+            if self._writer is not None and not self._writer._thread.is_alive():
+                self._writer = None
 
     def handle_message(self, message: Mapping[str, Any]) -> bool:
         """Queueing is required for 0.2; use :meth:`run` for embedded tests."""
@@ -2092,22 +2198,56 @@ class Extension:
         if not admission.acquire(blocking=False):
             if teardown:
                 # Losing an owner-retirement observation can leave live devices.
-                # Stop admission and run process cleanup independently of both lanes.
-                self.logger.error("teardown notification queue is full; stopping extension", method=method)
-                self._draining = True
-                self._cancel_all("teardown_overflow")
-                self._fail_pending(RpcError(-32000, "teardown notification queue is full"))
-                self._fail_closed_deadline = time.monotonic() + self.shutdown_timeout + self.cancellation_grace
-                self._start_shutdown(_MISSING, {"reason": "teardown_overflow"})
+                self._fail_closed("teardown_overflow", "teardown notification queue is full", method)
+            elif method == "ui/resize":
+                # The host discards the old frame and may send this geometry only
+                # once. Never keep a device active behind an invisible surface.
+                self._fail_closed("resize_overflow", "resize notification queue is full", method)
             else:
                 self.logger.warning("dropped lifecycle event because request queue is full", method=method)
             return
         try:
-            future = executor.submit(self._handle_lifecycle, method, params)
+            if method == "ui/resize":
+                # Ordinary workers may run concurrently. Chain resize handlers so
+                # an older geometry cannot overwrite a newer one after it runs.
+                future = executor.submit(self._handle_resize, params, self._resize_tail)
+                self._resize_tail = future
+            else:
+                future = executor.submit(self._handle_lifecycle, method, params)
         except Exception:
             admission.release()
             raise
         self._track_future(future, admission=admission)
+
+    def _handle_resize(self, params: Any, previous: Optional[Future[Any]]) -> None:
+        if previous is not None:
+            previous.result()
+        if not self._draining:
+            self._handle_lifecycle("ui/resize", params)
+
+    def _fail_closed(self, reason: str, message: str, method: Optional[str] = None,
+                     *, error: Optional[str] = None) -> None:
+        with self._lock:
+            if self._draining:
+                return
+            self._draining = True
+            self._fail_closed_deadline = time.monotonic() + self.shutdown_timeout + self.cancellation_grace
+        self._cancel_all(reason)
+        self._fail_pending(RpcError(-32000, message))
+        self._start_shutdown(_MISSING, {"reason": reason})
+
+        def report() -> None:
+            # Stderr is an external stream too. A blocked diagnostic must not
+            # delay device shutdown or the fail-closed routing deadline.
+            try:
+                fields = {"method": method}
+                if error is not None:
+                    fields["error"] = error
+                self.logger.error(f"{message}; stopping extension", **fields)
+            except Exception:
+                pass
+
+        threading.Thread(target=report, name="octet-extension-failure-log", daemon=True).start()
 
     def _handle_request(
         self,
@@ -2160,7 +2300,10 @@ class Extension:
         try:
             self._invoke(handler, self._object_params(params, method))
         except Exception as error:
-            self.logger.error("lifecycle handler failed", event=method, error=str(error))
+            if method == "ui/resize":
+                self._fail_closed("resize_failure", "resize handler failed", method, error=str(error))
+            else:
+                self.logger.error("lifecycle handler failed", event=method, error=str(error))
 
     def _dispatch(self, method: str, params: Any) -> Any:
         if method == "resource/dispose" and self._resources is not None:
@@ -3130,6 +3273,7 @@ class Extension:
         self._futures.clear()
         self._admission = threading.BoundedSemaphore(self.max_pending_requests)
         self._teardown_admission = threading.BoundedSemaphore(self.max_pending_requests)
+        self._resize_tail = None
         self._fail_closed_deadline = None
         self._shutdown_done.clear()
         self._eof_done.clear()

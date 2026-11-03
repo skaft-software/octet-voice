@@ -188,7 +188,8 @@ def clip(text, width):
 def _layout(columns, rows):
     columns = max(1, min(MAX_COLUMNS, columns))
     # Budget approximately a third of the terminal, not the unknown widget
-    # allocation. Prefer readable spacing, but keep short terminals compact.
+    # allocation. The optional top spacer is in addition to this budget. Prefer
+    # readable spacing, but keep short terminals compact.
     budget = max(1, rows // 3)
     spaced = budget >= 7  # heading, meter, one caption and controls plus gaps
     caption_rows = min(4, max(1, budget - 6 if spaced else budget - 3))
@@ -272,6 +273,8 @@ def render(snapshot, columns, microphone, speaker, color=True, *, rows=24, capti
         lines.insert(3, "")  # Before captions (or controls when no caption).
         if caption_window:
             lines.insert(-1, "")  # Between captions and controls.
+    if rows >= 5:
+        lines.insert(0, "")  # Separate the strip from the preceding content.
     return lines[:max(1, rows)]
 
 

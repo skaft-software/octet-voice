@@ -44,62 +44,75 @@ class RenderTests(unittest.TestCase):
                     self.assertTrue(all(cell_width(line) <= min(width, MAX_COLUMNS) for line in lines), lines)
                     self.assertTrue(all("\x1b" not in line for line in lines))
                     self.assertLessEqual(len(lines), min(13, rows))
+                    if rows >= 5:
+                        self.assertEqual(lines[0], "")
                     if rows >= 21:
-                        self.assertEqual((lines[1], lines[3], lines[-2]), ("", "", ""))
-        self.assertIn("01:05", render(state, 80, [], [], False)[0])
-        self.assertIn("preview", render(state, 80, [], [], False)[0])
+                        self.assertEqual((lines[2], lines[4], lines[-2]), ("", "", ""))
+        self.assertIn("01:05", render(state, 80, [], [], False)[1])
+        self.assertIn("preview", render(state, 80, [], [], False)[1])
 
     def test_vertical_padding_without_horizontal_justification(self):
         state = snapshot(caption="first line\nsecond line")
         lines = render(state, 80, [1], [1], False, rows=36)
-        self.assertEqual((lines[1], lines[3], lines[6]), ("", "", ""))
-        self.assertEqual(lines[0], "● voice · listening · preview 1/2 · ^F6/^F7 · 01:05")
-        self.assertEqual(lines[2], "MIC " + BARS[0] * 23 + BARS[-1] + "   OUT " + BARS[0] * 23 + BARS[-1])
-        self.assertEqual(lines[4:6], ["first line", "second line"])
-        self.assertEqual(lines[7], "^F10 stop · ^F9 mute · ^F8 toggle · ^F6/^F7 captions")
+        self.assertEqual((lines[0], lines[2], lines[4], lines[7]), ("", "", "", ""))
+        self.assertEqual(lines[1], "● voice · listening · preview 1/2 · ^F6/^F7 · 01:05")
+        self.assertEqual(lines[3], "MIC " + BARS[0] * 23 + BARS[-1] + "   OUT " + BARS[0] * 23 + BARS[-1])
+        self.assertEqual(lines[5:7], ["first line", "second line"])
+        self.assertEqual(lines[8], "^F10 stop · ^F9 mute · ^F8 toggle · ^F6/^F7 captions")
         self.assertTrue(all(not line.endswith(" ") for line in lines))
 
     def test_speaker_transcripts_stay_adjacent_and_empty_state_has_no_extra_gap(self):
         state = snapshot(user_transcript="one two three", voice_transcript="answer")
         lines = render(state, 80, [], [], False, rows=24)
-        self.assertEqual(lines[4:6], ["You: one two three", "Voice: answer"])
-        self.assertEqual(lines[6], "")
+        self.assertEqual(lines[5:7], ["You: one two three", "Voice: answer"])
+        self.assertEqual(lines[7], "")
         empty = render(snapshot(), 80, [], [], False, rows=24)
-        self.assertEqual(len(empty), 5)
-        self.assertEqual((empty[1], empty[3]), ("", ""))
+        self.assertEqual(len(empty), 6)
+        self.assertEqual((empty[0], empty[2], empty[4]), ("", "", ""))
 
     def test_small_terminal_uses_compact_rows_to_preserve_caption(self):
         lines = render(snapshot(caption="readable"), 80, [], [], False, rows=12)
-        self.assertEqual(len(lines), 4)
-        self.assertTrue(lines[0].startswith("● voice"))
-        self.assertTrue(lines[1].startswith("MIC "))
-        self.assertEqual(lines[2], "readable")
-        self.assertTrue(lines[3].startswith("^F10"))
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[0], "")
+        self.assertTrue(lines[1].startswith("● voice"))
+        self.assertTrue(lines[2].startswith("MIC "))
+        self.assertEqual(lines[3], "readable")
+        self.assertTrue(lines[4].startswith("^F10"))
         text = "one two three four five six seven eight"
         expected = wrap_caption(text, 7)
         visible = [render(snapshot(caption=text), 7, [], [], False, rows=12,
-                          caption_page=page)[:3][2] for page in range(len(expected))]
+                          caption_page=page)[:4][3] for page in range(len(expected))]
         self.assertEqual(tuple(visible), expected)
+
+    def test_tiny_terminals_prioritize_content_over_the_top_spacer(self):
+        for rows in range(1, 5):
+            with self.subTest(rows=rows):
+                lines = render(snapshot(caption="readable"), 80, [], [], False, rows=rows)
+                self.assertTrue(lines[0].startswith("● voice"))
+        lines = render(snapshot(caption="readable"), 80, [], [], False, rows=5)
+        self.assertEqual(lines[0], "")
+        self.assertEqual(lines[3], "readable")
+        self.assertTrue(lines[4].startswith("^F10"))
 
     def test_vertical_padding_preserves_caption_blank_lines_and_indentation(self):
         lines = render(snapshot(caption="first\n\n  indented\nlast\n"), 80, [], [], False,
                        rows=36, caption_page=1)
-        self.assertEqual(lines[4:8], ["", "  indented", "last", ""])
-        self.assertEqual(lines[8], "")  # Gap before the controls.
+        self.assertEqual(lines[5:9], ["", "  indented", "last", ""])
+        self.assertEqual(lines[9], "")  # Gap before the controls.
         last = render(snapshot(caption="first\n\n  indented\nlast\n"), 80, [], [], False,
                       rows=36, caption_page=4)
-        self.assertEqual(last[4], "")
-        self.assertIn("preview 5/5", last[0])
+        self.assertEqual(last[5], "")
+        self.assertIn("preview 5/5", last[1])
 
     def test_mute_is_textual_and_meter_histories_are_bounded(self):
         lines = render(snapshot(muted=True), 80, [1] * 100, [1] * 100, False)
-        self.assertIn("muted", lines[0])
-        self.assertIn("MIC muted " + BARS[0] * 24, lines[2])
-        self.assertIn("OUT " + BARS[-1] * 24, lines[2])
+        self.assertIn("muted", lines[1])
+        self.assertIn("MIC muted " + BARS[0] * 24, lines[3])
+        self.assertIn("OUT " + BARS[-1] * 24, lines[3])
         self.assertIn("unmute", lines[-1])
-        self.assertIn("MIC muted", render(snapshot(muted=True), 15, [1], [1], False)[2])
+        self.assertIn("MIC muted", render(snapshot(muted=True), 15, [1], [1], False)[3])
         lines = render(snapshot(), 80, [1] * 100 + [0] * 24, [], False)
-        self.assertNotIn(BARS[-1], lines[2])
+        self.assertNotIn(BARS[-1], lines[3])
         for width in range(1, 85):
             self.assertTrue(all(cell_width(line) <= width for line in
                                 render(snapshot(muted=True, caption="long caption " * 20), width, [1], [1], False)))
@@ -117,12 +130,12 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(caption_page_count(text, width), len(expected))
             recovered = []
             for position, row in enumerate(expected):
-                frame = render(state, width, [], [], False, caption_page=position)[:5]
-                recovered.append(frame[4])
+                frame = render(state, width, [], [], False, caption_page=position)[:6]
+                recovered.append(frame[5])
             self.assertEqual(tuple(recovered), expected)
             self.assertEqual("".join(recovered), text)
         frame = render(state, 80, [], [], False)
-        self.assertIn("^F6/^F7", frame[0])  # Hints survive a cropped controls row.
+        self.assertIn("^F6/^F7", frame[1])  # Hints survive a cropped controls row.
         self.assertIn("^F6/^F7", frame[-1])
 
     def test_newlines_blank_lines_indentation_and_tabs_are_preserved(self):
@@ -182,15 +195,15 @@ class RenderTests(unittest.TestCase):
         rows = wrap_caption(text, 80)
         self.assertIn("You:", rows[0])
         voice_position = next(i for i, row in enumerate(rows) if row.startswith("Voice:"))
-        self.assertIn("Voice:", render(state, 80, [], [], False, caption_page=voice_position)[4])
+        self.assertIn("Voice:", render(state, 80, [], [], False, caption_page=voice_position)[5])
         self.assertEqual(caption_text(snapshot(caption="legacy")), "legacy")
         self.assertEqual(caption_text(snapshot(user_transcript="", voice_transcript="")), "")
 
     def test_caption_is_not_dimmed_and_colors_use_terminal_palette(self):
         lines = render(snapshot(caption="readable caption"), 80, [1], [1])
-        self.assertNotIn("\x1b", lines[4])
-        self.assertIn("\x1b[36m", lines[2])
-        self.assertIn("\x1b[35m", lines[2])
+        self.assertNotIn("\x1b", lines[5])
+        self.assertIn("\x1b[36m", lines[3])
+        self.assertIn("\x1b[35m", lines[3])
         self.assertNotIn("38;", "".join(lines))
         self.assertNotIn("48;", "".join(lines))
 
@@ -256,7 +269,7 @@ class StripTests(unittest.TestCase):
         eventually(lambda: bool(self.ext.frames))
         self.assertTrue(self.strip.page(-10**6))
         self.assertTrue(self.strip.page(4))
-        eventually(lambda: "preview 5/" in plain(self.ext.frames[-1]["lines"])[0])
+        eventually(lambda: "preview 5/" in plain(self.ext.frames[-1]["lines"])[1])
         self.service.state["voice_transcript"] += "new words " * 100
         expected_text = caption_text(self.service.state)
         eventually(lambda: self.strip._caption == expected_text)
@@ -281,10 +294,10 @@ class StripTests(unittest.TestCase):
                                   caption="Voice: spoken reply")
         self.strip.open(OWNER, 7)
         eventually(lambda: bool(self.ext.frames) and "Voice: spoken reply" in
-                   plain(self.ext.frames[-1]["lines"])[4])
+                   plain(self.ext.frames[-1]["lines"])[5])
         self.assertGreater(self.strip._caption_page, 0)
         self.strip.page(-10**6)
-        eventually(lambda: "You: long user" in plain(self.ext.frames[-1]["lines"])[4])
+        eventually(lambda: "You: long user" in plain(self.ext.frames[-1]["lines"])[5])
         self.service.state["voice_transcript"] += " continues"
         self.service.state["caption"] = "Voice: spoken reply continues"
         eventually(lambda: self.strip._caption.endswith("spoken reply continues"))
@@ -293,7 +306,7 @@ class StripTests(unittest.TestCase):
         self.strip.page(10**6)
         self.strip.page(1)
         eventually(lambda: "Voice: spoken reply continues" in
-                   plain(self.ext.frames[-1]["lines"])[4])
+                   plain(self.ext.frames[-1]["lines"])[5])
         self.assertFalse(self.strip._browsing)
 
     def test_no_color_environment_disables_all_sgr(self):

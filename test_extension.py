@@ -380,12 +380,13 @@ class ExtensionTests(unittest.TestCase):
             "final": True, "sequence": 1})
         # Follow mode starts with the latest two adjacent wrapped rows.
         first = self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
-            and "preview 2/3" in msg["params"]["lines"][0])
+            and "preview 2/3" in msg["params"]["lines"][1])
+        self.assertEqual(first["params"]["lines"][0], "")
         self.host.reader.feed(rpc_request(12, "shortcut/execute", {
             "name": "voice-caption-down", "context": CONTEXT}))
         self.assertEqual(self.result(12)["text"], "")
         second = self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
-            and "preview 3/3" in msg["params"]["lines"][0])
+            and "preview 3/3" in msg["params"]["lines"][1])
         self.assertGreater(second["params"]["revision"], first["params"]["revision"])
         other = copy.deepcopy(CONTEXT)
         other["resource_owner"]["session_id"] = "other-session"
@@ -396,23 +397,23 @@ class ExtensionTests(unittest.TestCase):
         self.assertEqual(self.result(15)["text"], "")
         unchanged = self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
             and msg["params"]["revision"] > second["params"]["revision"]
-            and "preview 3/3" in msg["params"]["lines"][0])
+            and "preview 3/3" in msg["params"]["lines"][1])
         self.command(13, ["captions", "up"])
         self.assertEqual(self.result(13)["text"], "")
         middle = self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
             and msg["params"]["revision"] > unchanged["params"]["revision"]
-            and "preview 2/" in msg["params"]["lines"][0])
+            and "preview 2/" in msg["params"]["lines"][1])
         self.host.reader.feed(rpc_request(16, "shortcut/execute", {
             "name": "voice-caption-up", "context": CONTEXT}))
         self.assertEqual(self.result(16)["text"], "")
         top = self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
             and msg["params"]["revision"] > middle["params"]["revision"]
-            and "preview 1/" in msg["params"]["lines"][0])
+            and "preview 1/" in msg["params"]["lines"][1])
         self.command(17, ["captions", "down"])
         self.assertEqual(self.result(17)["text"], "")
         self.host.writer.wait_for(lambda msg: msg.get("method") == "ui/frame"
             and msg["params"]["revision"] > top["params"]["revision"]
-            and "preview 2/" in msg["params"]["lines"][0])
+            and "preview 2/" in msg["params"]["lines"][1])
         self.assertEqual(self.host.writer.matching(lambda msg: msg.get("method") == "notification"), [])
 
     def test_live_transcriptions_are_ephemeral_and_keep_both_speakers(self):

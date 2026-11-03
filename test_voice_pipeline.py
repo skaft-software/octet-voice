@@ -79,12 +79,13 @@ class VoicePipelineTests(unittest.TestCase):
                         return ext.frames[-1] if ext.frames else None
 
                 eventually(lambda: current_frame() is not None
-                           and marker in ANSI.sub("", current_frame()["lines"][0]))
+                           and marker in ANSI.sub("", current_frame()["lines"][1]))
                 frame = current_frame()
-                self.assertGreaterEqual(len(frame["lines"]), 5)
-                self.assertEqual(frame["lines"][1], "")
-                self.assertEqual(frame["lines"][3], "")
-                visible.append(ANSI.sub("", frame["lines"][4]))
+                self.assertGreaterEqual(len(frame["lines"]), 6)
+                self.assertEqual(frame["lines"][0], "")
+                self.assertEqual(frame["lines"][2], "")
+                self.assertEqual(frame["lines"][4], "")
+                visible.append(ANSI.sub("", frame["lines"][5]))
                 if page + 1 < pages:
                     self.assertTrue(strip.page(1))
             displayed = " ".join(visible)

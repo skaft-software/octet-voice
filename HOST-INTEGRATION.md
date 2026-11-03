@@ -1,7 +1,10 @@
 # Host integration
 
-Target: octet v0.10.0 candidate, base `47389ad1`. This repository does not fork or
-replace octet's authentication, process supervisor, UI protocol, or coding agent.
+Target: an octet v0.10.0 candidate. The SDK snapshot and patches below were
+prepared from octet base `47389ad1`. A later candidate may already include some
+or all of those generic host changes; inspect its source before applying a patch.
+This repository does not fork or replace octet's authentication, process
+supervisor, UI protocol, or coding agent.
 
 - The complete extension is at the repository root. `build-package.py` packages
   an explicit source allowlist, including the reviewed Python SDK under `vendor/`.
@@ -16,7 +19,8 @@ replace octet's authentication, process supervisor, UI protocol, or coding agent
   the two unconditional shortcut-dispatch transcript notices, preserving actual
   results/errors. It is not applied or included in installed extension bundles.
   Review it against the matching octet source and run the host's shortcut tests
-  before building your own host. The extension works without it.
+  before building your own host. Do not reapply it if the candidate already
+  includes the change. The extension works without it.
 - Codex credentials come from native `provider/credentials`, using the same
   native OAuth login and refresh as coding. No second sign-in or credential-file
   discovery is implemented. Public OpenAI Realtime uses the native OpenAI provider

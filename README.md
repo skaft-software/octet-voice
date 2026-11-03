@@ -43,24 +43,30 @@ ephemeral and are omitted from `/voice status`. Each utterance is bounded to
 16,384 UTF-8 bytes; exceeding the limit stops voice with an explicit error rather
 than silently clipping a caption. Older utterances are not a caption history.
 
-Captions wrap to terminal width and the heading marks them as a **preview**. Long
-captions follow the most recent speaker unless you scroll to review them. Use
+Captions wrap to terminal width and the heading marks them as a **preview**.
+`preview 1/3` means the visible window starts at wrapped caption row 1 of 3,
+not that there are three recordings or conversations. The count covers the
+retained user and voice utterances together; a window may show multiple rows,
+so these positions overlap rather than being separate pages. The label remains
+because the host may crop the strip even when the extension renders all the rows.
+Long captions follow the most recent speaker unless you scroll to review them. Use
 Ctrl+F6/F7 (or the slash commands above) to scroll by one wrapped row; scrolling
 persists across live updates and reflow. Press down again at the last row to resume
 following. The host does not tell the extension how
 many above-composer rows it actually allocates, and may crop the strip to protect
-other UI. If there is room for the heading, meters, their intervening padding
-and one caption row, scrolling can bring each retained row into view even if
+other UI. If there is room for the top padding, heading, meters, their intervening
+padding and one caption row, scrolling can bring each retained row into view even if
 additional rows are hidden. In very
 small or crowded terminals the host may hide even the first caption row: enlarge
 the terminal or reduce other panels. The strip cannot guarantee all captions are
 simultaneously visible on the current host.
 
-The strip uses blank rows between its heading, meters, caption block and controls
-rather than spreading content across the terminal. Caption lines remain adjacent;
-blank lines actually present in a transcript are preserved. It switches to compact
-rows on short terminals; the host can still crop the strip because its actual
-widget budget is not exposed. The strip resizes
+The strip uses a blank row above its heading and blank rows between its heading,
+meters, caption block and controls rather than spreading content across the
+terminal. Caption lines remain adjacent; blank lines actually present in a transcript
+are preserved. It switches to compact rows on short terminals and omits the top
+padding below five terminal rows; the host can still crop the strip because its
+actual widget budget is not exposed. The strip resizes
 without taking focus or replacing the normal composer, and uses terminal palette
 colors (`NO_COLOR` disables styling). It disappears on
 stop, failure, session replacement or shutdown. Routine start/mute/stop and

@@ -1,15 +1,18 @@
 # octet-voice
 
-Experimental native realtime voice extension for [octet](https://github.com/skaft-software/octet).
-Standalone source repository; not an official release or a production qualification.
+Experimental first-party realtime voice extension for [octet](https://github.com/skaft-software/octet).
+This standalone repository is its source of truth. Experimental status is not a
+production or cross-platform audio qualification.
 
 Optional **bidirectional realtime voice**, not dictation followed by text-to-speech:
 live microphone audio, conversational spoken responses, and delegation into the
 active coding conversation. The voice model never executes tools itself. The
 ordinary octet agent still owns coding, tools, effects and cancellation policy.
-Requires the v0.10.0 candidate host. The needed Python SDK snapshot is vendored
-under `vendor/` with its license, provenance and regression tests.
-Not in the official release catalog; no automatic enablement or recording.
+Targets octet v0.10.0 exactly. The needed Python SDK snapshot is vendored under
+`vendor/` with its license, provenance and regression tests. Voice is optional:
+installation, dependency setup and enablement are separate explicit actions; it
+never starts recording automatically. Inclusion in the official v0.10.0 catalog
+and Packages page is prepared for the release owner, not a claim of publication.
 
 ## Controls
 
@@ -172,7 +175,15 @@ Owner/generation changes fence further injection; session settlement, shutdown a
 extension process-tree supervision close media. A conversation is limited to one
 hour; there is no reliable realtime spend meter in this version.
 
-## Local install
+## Install and setup
+
+After a verified octet v0.10.0 release includes the voice bundle, install it with
+`octet extension install octet-voice`. This command does not enable voice or
+provision dependencies. Use the installed bundle's `requirements.lock` with the
+explicit setup below, then enable `octet-voice` only when wanted. Until that
+release is published, use the reviewed local-archive route below instead. See
+[RELEASE.md](https://github.com/skaft-software/octet-voice/blob/main/RELEASE.md)
+for release qualification and publication gates.
 
 Audio backend selection is native to the machine running octet:
 
@@ -200,7 +211,9 @@ never falls back to global dependencies, and never downloads or installs anythin
 On Windows it queries the native profile directory because the host sanitizes
 `USERPROFILE`. Keep `uv` and dependency acquisition in explicit setup only.
 
-From this repository (explicit setup; dependency acquisition may use the network):
+From this repository (explicit setup; dependency acquisition may use the network).
+For a catalog installation, skip the package build and `--path` installation and
+use `~/.octet/extensions/octet-voice/requirements.lock` in the `uv pip sync` step:
 
 ```sh
 uv venv --python 3.14 ~/.local/share/octet-voice/venv
@@ -213,7 +226,9 @@ octet --enable-extension octet-voice
 ```
 
 On Windows, the same private environment is under
-`%USERPROFILE%\.local\share\octet-voice\venv`; provision it explicitly in PowerShell:
+`%USERPROFILE%\.local\share\octet-voice\venv`; provision it explicitly in PowerShell.
+For a catalog installation, skip the package build and `--path` installation and
+use `$HOME/.octet/extensions/octet-voice/requirements.lock` for `uv pip sync`:
 
 ```powershell
 uv venv --python 3.14 "$HOME/.local/share/octet-voice/venv"
@@ -241,12 +256,13 @@ network (OpenAI/Codex), process (private Python and Linux PipeWire), unrestricte
 preferences and private interpreter) and provider-credential disclosure.
 These declarations describe authority, **not a sandbox**. Installation and
 persistent enablement remain separate; the latter is an explicit user decision.
-The strip itself works on the unmodified candidate through negotiated `remote_ui`;
-SDK changes are vendored into the staged extension, not globally installed.
-For fully quiet controls, `patches/quiet-shortcuts.patch` contains the optional
-generic native-host change that removes unconditional shortcut-dispatch notices.
-The unmodified candidate works but still emits that host notice. See
-[HOST-INTEGRATION.md](HOST-INTEGRATION.md); no host patch is applied by installation.
+The strip uses negotiated `remote_ui`; SDK changes are vendored into the staged
+extension, not globally installed. PR #639's candidate head `f51fe29` already
+includes the generic SDK and quiet-shortcut host changes. Older candidates may
+still emit shortcut-dispatch notices; `patches/quiet-shortcuts.patch` is an
+optional host patch for the matching older source, not something to reapply to
+that head. See [HOST-INTEGRATION.md](HOST-INTEGRATION.md); installation never
+applies a host patch or modifies the release catalog.
 
 Preferences are atomically written at `~/.config/octet/voice.json` (no secrets).
 Files use mode 0600 on POSIX; Windows uses the inherited user-profile ACL
@@ -310,6 +326,14 @@ PYTHONPATH=vendor:tests/sdk ~/.local/share/octet-voice/venv/bin/python \
 On Windows PowerShell, set `$env:PYTHONPATH = "vendor;tests/sdk"` and use
 `& "$HOME/.local/share/octet-voice/venv/Scripts/python.exe"` for the interpreter.
 Run the same two `-m unittest discover` commands (without the POSIX assignments).
+
+This source repository also contains `scripts/host-smoke.py` for testing an
+explicit Linux octet binary with a preprovisioned locked voice venv. It uses an
+isolated home and a PATH without PipeWire tools to stop voice before credentials,
+audio or provider calls. The workflow uses it against a source-bound host; this
+test script is not included in the source-only extension archive. The workflow
+and final-release gates are described in `RELEASE.md`. Neither fixture tests nor
+the Linux host smoke test qualify macOS/Windows audio.
 
 Fixtures cover duplex media, V2/V3 wire frames, OAuth signaling/sideband header
 containment, malformed/oversized events, mute queue invalidation, silence pacing,

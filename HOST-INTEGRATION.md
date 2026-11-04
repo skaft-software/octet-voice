@@ -26,24 +26,59 @@ supervisor, UI protocol, or coding agent.
   discovery is implemented. Public OpenAI Realtime uses the native OpenAI provider
   instead, only when explicitly selected.
 
-## Private v0.10.0 handoff
+## Experimental first-party v0.10.0 handoff
 
-The private repository's provider-free workflow tests Linux, macOS and Windows,
-then builds a reproducible source-only bundle and uploads the
-`octet-voice-0.10.0-experimental` workflow artifact. It contains the archive,
-`SHA256SUMS`, and `SOURCE_COMMIT`. The artifact is available only to identities
-with access to the private workflow run and expires after 30 days. Obtain the
+As checked on 2026-11-04, public octet PR #639 at head
+`f51fe29aeac328ebf6047f4767dfeb5e575b5273` already contains the generic
+Python SDK integration (`a17249b6`) and quiet shortcut dispatch (`cc660b7c`).
+The host SDK files at that head match the SDK vendored by voice source commit
+`7ad5e1cf011e93567452618cd817de5114c747cf`. The older patches must not be
+reapplied to that head. These are host-side prerequisites; they do not by
+themselves include voice in an octet release.
+
+The provider-free workflow in this checkout tests Linux, macOS and Windows. It
+also builds an exact public octet host source on Linux and exercises installation,
+explicit enablement, status, feature negotiation and UI opening with audio absent.
+By default it selects the PR head while PR #639 is open, and the v0.10.0 tag
+once it is closed. Only after those jobs pass does it build a reproducible
+source-only bundle and upload `octet-voice-0.10.0-experimental`. The artifact
+contains the archive, `SHA256SUMS`, `SOURCE_COMMIT`, `OCTET_HOST_COMMIT` and
+`OCTET_HOST_TARGET`. A manual run can explicitly select the PR (`candidate`),
+the tag (`tag`) or the published stable release (`release`). The workflow
+rechecks the selected host reference before packaging. It does not publish a
+release or automatically rerun when the public PR moves. Changes to this workflow
+must be committed and run before they constitute CI evidence.
+
+The workflow artifact expires after 30 days; its visibility follows the repository
+and Actions settings, and it is not durable release distribution. Obtain the
 expected commit and digest through a trusted channel; a checksum in the same
 artifact alone does not authenticate its origin. The manifest targets exactly
-host version 0.10.0. Test the actual target host build rather than inferring its
-source from that version string.
+host version 0.10.0. Recheck the tested commit against the final host and test the
+actual release binary rather than inferring its source from that version string.
+See `RELEASE.md` in the source repository for the handoff gates; it is not included
+in the source-only bundle.
+
+For the source revisions above, private workflow run `41573640244` passed its
+Linux, macOS and Windows provider-free jobs and produced an archive with SHA-256
+`bcf1767a4c1821e8e622b3e988324b21db0a844c6575785ed17c46e0ee79efde`.
+This is evidence for that earlier source commit, not for later documentation or
+workflow changes. A clean local rebuild matched that archive byte for byte. On
+Linux, an offline release build of the exact PR head installed it in an isolated home, discovered
+and explicitly enabled it, and returned a stopped `/voice status`. A deliberately
+missing audio prerequisite then stopped `/voice start` after feature negotiation
+and remote UI opening, before credentials, devices or provider calls. A separate
+idle PTY check on that host dispatched a generic SDK shortcut without the old
+notice. These checks do not qualify live voice, other platforms, busy shortcut
+dispatch, or a future final release artifact; repeat integration checks against
+the actual release candidate before handoff.
 
 Release workers do not automatically discover this separate repository: the
 native host's compiled official catalog and release packaging consume the host
-repository's `extensions/release-catalog.txt`. This private experiment is not
-in that catalog. It may be explicitly installed from its reviewed local archive;
-adding it to a public official release would be a separate publication and
-qualification decision. Do not silently copy it into a public release.
+repository's `extensions/release-catalog.txt` and tracked source snapshots. The
+v0.10.0 preparation adds a snapshot pinned to an exact voice commit; this
+repository remains the source of truth. The release owner must verify the pin,
+qualification, version-matched signed bundle and Packages-page listing before
+publication. Preparing a catalog entry or CI artifact is not publication.
 
 ## Qualification boundaries
 

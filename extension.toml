@@ -2,7 +2,7 @@ name = "octet-voice"
 version = "0.10.0"
 api_version = "0.4"
 requires_octet = "=0.10.0"
-description = "Optional bidirectional realtime voice with coding-agent handoff"
+description = "Experimental optional bidirectional realtime voice with coding-agent handoff"
 
 [entrypoint]
 # Native host Python-script launch works on all three platforms without a shell.
